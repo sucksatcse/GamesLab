@@ -2,7 +2,7 @@
 
 ## 1. System Architecture
 
-GamesLab follows a **Modular Monolith** architecture powered by **Next.js App Router** (hosted on Vercel) and **Supabase** (PostgreSQL, Auth, Realtime).
+GamesLab follows a **Modular Monolith** architecture powered by **Next.js 16 App Router** (hosted on Vercel) and **Supabase** (PostgreSQL, Auth, Realtime).
 
 ```text
 +-------------------------------------------------------------------------+
@@ -14,10 +14,11 @@ GamesLab follows a **Modular Monolith** architecture powered by **Next.js App Ro
                     | HTTPS (Cookies / RSC / Actions) | WebSocket (WSS)
                     v                                 |
 +---------------------------------------------+       |
-|         NEXT.JS APP ROUTER (Vercel)         |       |
-|  1. Middleware: refreshes Supabase session   |       |
+|       NEXT.JS 16 APP ROUTER (Vercel)        |       |
+|  1. Proxy (src/proxy.ts): refreshes session |       |
+|     cookie & handles UX redirects ONLY      |       |
 |  2. Server Components: read queries (SSR)   |       |
-|  3. Server Actions: Zod-validated mutations |       |
+|  3. Server Actions: auth + Zod mutations    |       |
 |  4. Route Handlers (/api/*): JSON endpoints |       |
 +-------------------+-------------------------+       |
                     | HTTPS / Postgres Wire           |
@@ -26,7 +27,7 @@ GamesLab follows a **Modular Monolith** architecture powered by **Next.js App Ro
 |                         SUPABASE PLATFORM                               |
 |  +------------------+   +--------------------+   +-------------------+  |
 |  |  Supabase Auth   |   |  PostgreSQL + RLS  |   | Supabase Realtime |  |
-|  | (Users & JWTs)   |   | (App Data & Rules) |   | (Channel Pub/Sub) |  |
+|  | (Users & JWTs)   |   | (Least-Privilege)  |   | (Channel Pub/Sub) |  |
 |  +------------------+   +--------------------+   +-------------------+  |
 +-------------------------------------------------------------------------+
 ```
@@ -44,7 +45,7 @@ GamesLab follows a **Modular Monolith** architecture powered by **Next.js App Ro
 gameslab/
 ├── docs/                          # Architecture, SRS, ERD, and decision notes
 ├── supabase/
-│   ├── migrations/                # Versioned SQL schema & RLS policies
+│   ├── migrations/                # Versioned SQL schema, triggers & RLS policies
 │   └── seed.sql                   # Initial game catalog seed for dev/testing
 ├── src/
 │   ├── app/                       # Next.js App Router (routes & layouts only)
@@ -52,7 +53,7 @@ gameslab/
 │   │   ├── (main)/                # Route group: shared navbar/footer layout
 │   │   │   ├── page.tsx           # Home / Discovery & Following Feed
 │   │   │   ├── games/
-│   │   │   │   ├── page.tsx       # /games (search & filter catalog)
+│   │   │   │   ├── page.tsx       # /games (URL searchParams filter catalog)
 │   │   │   │   └── [slug]/page.tsx# /games/[slug] (game details & reviews)
 │   │   │   ├── lists/
 │   │   │   │   ├── page.tsx       # /lists
@@ -61,13 +62,12 @@ gameslab/
 │   │   │   │   └── page.tsx       # /u/[username] (user gaming profile)
 │   │   │   ├── communities/
 │   │   │   │   ├── page.tsx       # /communities (directory)
-│   │   │   │       └── [slug]/
-│   │   │   │           ├── page.tsx           # Community overview / default channel
-│   │   │   │           └── [channelId]/page.tsx # Specific text channel
+│   │   │   │   └── [slug]/
+│   │   │   │       ├── page.tsx           # Community overview / default channel
+│   │   │   │       └── [channelId]/page.tsx # Specific text channel
 │   │   │   └── settings/page.tsx  # Profile settings
-│   │   ├── api/                   # Route Handlers (JSON endpoints when needed)
-│   │   │   ├── health/route.ts    # Health check endpoint
-│   │   │   └── games/search/route.ts # Debounced search / external API proxy
+│   │   ├── api/                   # Route Handlers (minimal JSON endpoints)
+│   │   │   └── health/route.ts    # Health check endpoint (add search route only if proxying external API)
 │   │   ├── layout.tsx             # Root layout (fonts, theme, toast provider)
 │   │   └── globals.css            # Tailwind CSS entry
 │   ├── components/
@@ -79,9 +79,9 @@ gameslab/
 │   │   └── communities/           # ChannelSidebar, ChatWindow, MessageInput
 │   ├── lib/
 │   │   ├── supabase/
-│   │   │   ├── client.ts          # Browser Supabase client
-│   │   │   ├── server.ts          # Server Component / Action Supabase client
-│   │   │   └── middleware.ts      # Session refresh helper
+│   │   │   ├── client.ts          # Browser Supabase client (createBrowserClient)
+│   │   │   ├── server.ts          # Server Component / Action client (createServerClient)
+│   │   │   └── session.ts         # Session refresh helper (updateSession)
 │   │   ├── validations/           # Zod schemas
 │   │   └── utils.ts               # Shared helpers
 │   ├── services/                  # Server-side data access functions
@@ -92,7 +92,8 @@ gameslab/
 │   │   └── communities.ts
 │   ├── types/
 │   │   └── database.ts            # Generated Supabase TypeScript types
-│   └── middleware.ts              # Root Next.js middleware for auth cookies
+│   └── proxy.ts                   # Next.js 16 proxy boundary (exports proxy())
+├── eslint.config.mjs              # Direct ESLint flat config (replaces deprecated next lint)
 ├── .env.example                   # Template of required environment variables
 ├── .env.local                     # Local secrets (gitignored)
 ├── package.json
@@ -107,9 +108,9 @@ GamesLab uses the right Next.js mechanism for each communication pattern:
 
 | Mechanism | GamesLab Use Cases | Rationale |
 |---|---|---|
-| **Server Components (RSC)** | Reading games, game details, reviews, profiles, lists, initial channel messages | Executes directly on the server with no extra HTTP `/api/*` hop and keeps DB logic off the client bundle. |
-| **Server Actions** | Creating/editing/deleting reviews, lists, list items, follows, communities, channels, and profile updates | Strongly typed mutations invoked from forms/components, paired with `revalidatePath()` to refresh server caches cleanly. |
-| **Route Handlers (`app/api/*`)** | Client-side debounced game search (`/api/games/search`), health checks, or proxying external game APIs | Standard HTTP JSON interface when a Client Component needs dynamic fetching or secret third-party API keys must stay server-side. |
+| **Server Components (RSC)** | Reading games (`/games?q=...`), game details, reviews, profiles, lists, initial channel messages | Executes directly on the server with no extra HTTP `/api/*` hop and keeps DB logic off the client bundle. Using URL search params avoids building a duplicate `/api/games/search` endpoint for MVP. |
+| **Server Actions** | Creating/editing/deleting reviews, lists, list items, follows, communities, channels, messages, and profile updates | Strongly typed mutations invoked from forms/components, paired with `revalidatePath()` to refresh server caches cleanly. |
+| **Route Handlers (`app/api/*`)** | `/api/health` (and external game API proxy only if an external catalog API with secret keys is chosen) | Standard HTTP JSON interface when external webhooks or server-side third-party API proxies are required. |
 | **Supabase Realtime** | Live message stream inside a community text channel | Pushes newly inserted `messages` rows over WebSocket to active channel viewers without polling. |
 
 ### Standard Mutation Response Envelope
@@ -121,14 +122,29 @@ All Server Actions and Route Handlers return a predictable, typed result:
 
 ## 4. Security Considerations
 
-1. **HTTP-Only Cookie Sessions (`@supabase/ssr`):** Auth tokens are stored in HTTP-only cookies refreshed by Next.js middleware rather than `localStorage`, mitigating XSS token theft.
-2. **Server Identity Verification:** Always authenticate the caller on the server with `supabase.auth.getUser()` (never trust a `user_id` sent in a request body, and avoid relying solely on `getSession()` on the server).
-3. **Defense-in-Depth with PostgreSQL RLS:** Every table in the `public` schema must have RLS enabled and explicit policies for `SELECT`, `INSERT`, `UPDATE`, and `DELETE`.
-   - *Example (`lists`):* `SELECT` allowed when `is_public = true OR auth.uid() = user_id`; writes allowed only when `auth.uid() = user_id`.
-   - *Example (`messages`):* `SELECT` and `INSERT` allowed only when the user is a member of the channel's parent community in `community_members`.
-4. **Input Validation & XSS Prevention:** Validate all payloads on the server with Zod (field lengths, rating bounds, UUID format). Render user text normally in React (never `dangerouslySetInnerHTML`).
-5. **Secrets Hygiene:** Only `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` may use the `NEXT_PUBLIC_` prefix. `SUPABASE_SERVICE_ROLE_KEY` and any third-party game API keys must stay strictly server-side and out of Git.
-6. **Bounded Queries & Abuse Prevention:** Enforce pagination limits (e.g., max 50 rows per query) and text length limits on reviews and channel messages.
+1. **Supabase SSR Cookie Architecture (`@supabase/ssr`):**
+   - `@supabase/ssr` does **not** use `httpOnly` cookies when paired with `createBrowserClient`. Auth tokens are stored in **browser-accessible, chunked cookies** (`SameSite=Lax`, `Path=/`, and `Secure` over HTTPS in production).
+   - **Why:** Both the Next.js server (`createServerClient` / `src/proxy.ts`) and browser client (`createBrowserClient`, needed for client-side auth state and authenticated **Supabase Realtime** WebSocket subscriptions) must read and synchronize the session. Setting `httpOnly: true` would hide the cookie from `document.cookie` and break `createBrowserClient`.
+   - **Required Trade-off Mitigation:** Because cookies are readable by client-side scripts, **XSS prevention is critical**: render all user-generated content safely through React escaping, never use `dangerouslySetInnerHTML`, validate/bound inputs with Zod, and review third-party packages carefully. *(Note: True `httpOnly`-only sessions would require removing `createBrowserClient` and proxying all auth and Realtime traffic through custom server endpoints, which is unnecessary complexity for this 10-day MVP.)*
+
+2. **Three-Layer Authorization Model (`src/proxy.ts` Is NOT Authorization):**
+   - **Layer 1 — Network Boundary (`src/proxy.ts`):** Refreshes the Supabase auth cookie and handles optimistic UX redirects (e.g., bouncing unauthenticated visitors from `/settings` to `/login`). **`proxy.ts` is never treated as a security boundary**—it cannot check object ownership, and Server Actions or Route Handlers can be called directly.
+   - **Layer 2 — Server Application Logic:** Every Server Component, Server Action, and Route Handler verifies identity independently via `supabase.auth.getUser()` (never trust a `user_id` from client form input, and never rely solely on `getSession()` on the server) and checks business permissions before mutating data.
+   - **Layer 3 — Database Enforcement (PostgreSQL RLS):** Enforces row-level ownership and community membership inside PostgreSQL itself.
+
+3. **Least-Privilege PostgreSQL RLS (Deny-by-Default):**
+   - Enable RLS on every table in the `public` schema.
+   - Do **not** grant all four CRUD permissions (`SELECT`, `INSERT`, `UPDATE`, `DELETE`) on every table. In PostgreSQL RLS, any operation without an explicit policy is **denied by default**. Grant only the minimum operations required per table (see the full matrix in [03-database-erd.md](./03-database-erd.md#4-least-privilege-rls-policy-matrix)).
+   - *Examples:* `games` allows public `SELECT` only (zero client write policies); `follows` allows `SELECT`, `INSERT`, `DELETE` (no `UPDATE`); `profiles` allows `SELECT` and owner `UPDATE` (created via DB trigger, not client `INSERT`).
+
+4. **Input Validation & XSS Prevention:**
+   - Validate all Server Action and Route Handler payloads with Zod (string lengths, rating bounds `1..10`, UUID format, trimmed non-empty strings).
+
+5. **Secrets Hygiene:**
+   - Only `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` may use the `NEXT_PUBLIC_` prefix. `SUPABASE_SERVICE_ROLE_KEY` (which bypasses RLS) and any external game API keys must stay strictly server-side and out of Git.
+
+6. **Bounded Queries & Abuse Prevention:**
+   - Enforce pagination limits (e.g., max 50 rows per query) and text length limits on reviews and channel messages.
 
 ---
 
@@ -138,11 +154,13 @@ All Server Actions and Route Handlers return a predictable, typed result:
    - Initialize the first commit on `main` (migrating from the empty `master` branch) and connect a GitHub remote.
    - Work in short-lived feature branches per milestone (e.g., `feat/day2-scaffold`, `feat/day3-db-schema`) and merge via Pull Requests.
    - Follow Conventional Commits (`docs:`, `feat:`, `fix:`, `chore:`).
-2. **Environment Separation:**
-   - **Development:** `.env.local` connected to a dedicated `GamesLab-Dev` Supabase project (or local Supabase CLI).
-   - **Production:** Vercel environment variables connected to a separate `GamesLab-Prod` Supabase project.
+2. **Environment Separation (MVP-Friendly):**
+   - **Development:** `.env.local` connected to a dedicated hosted `GamesLab-Dev` Supabase project (keeping local Docker Supabase CLI optional so Windows container setup doesn't stall a 10-day sprint).
+   - **Production:** Vercel environment variables connected to a separate hosted `GamesLab-Prod` Supabase project.
 3. **CI/CD (GitHub + Vercel):**
-   - Every Pull Request generates a Vercel **Preview Deployment** and runs `tsc --noEmit` + `next lint`.
-   - Merging to `main` triggers the **Production Deployment**.
+   - Next.js 16 **removed `next lint`**. Instead, run direct static checks in `package.json` and PR verification:
+     - `npx tsc --noEmit` (strict TypeScript check)
+     - `npx eslint .` using ESLint flat config (`eslint.config.mjs` with `eslint-config-next`) — *or optionally **Biome** (`npx biome check .`) as a faster single-tool linter/formatter alternative.*
+   - Every Pull Request generates a Vercel **Preview Deployment**; merging to `main` triggers the **Production Deployment**.
 4. **Versioned Migrations:**
-   - Every schema change and RLS policy is saved in `supabase/migrations/` as SQL rather than untracked dashboard edits.
+   - Every schema change, trigger, and RLS policy is saved in `supabase/migrations/` as SQL rather than untracked dashboard edits.
